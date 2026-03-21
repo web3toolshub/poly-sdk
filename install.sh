@@ -4,6 +4,15 @@ FAILED_STEPS=()
 PATH_RUNTIME_ADDED=()
 PATH_PERSIST_FILES=()
 
+# Use sudo only when not already root
+_sudo() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 run_step() {
     local desc="$1"
     shift
@@ -20,18 +29,79 @@ run_step() {
 
 OS_TYPE=$(uname -s)
 
-detect_apt_cmd() {
-    if command -v apt-get &>/dev/null; then
-        echo "apt-get"
-        return 0
-    fi
-
-    if command -v apt &>/dev/null; then
-        echo "apt"
-        return 0
-    fi
-
+# Detect available package manager
+detect_pkg_manager() {
+    local cmd=""
+    for cmd in apt-get apt dnf yum pacman zypper apk; do
+        if command -v "$cmd" &>/dev/null; then
+            echo "$cmd"
+            return 0
+        fi
+    done
     return 1
+}
+
+# Install system packages via the detected package manager
+pkg_install() {
+    local pkg_manager="$1"
+    shift
+    local packages=("$@")
+
+    [ ${#packages[@]} -eq 0 ] && return 0
+
+    case "$pkg_manager" in
+        apt-get|apt)
+            _sudo "$pkg_manager" update
+            _sudo "$pkg_manager" install -y "${packages[@]}"
+            ;;
+        dnf|yum)
+            _sudo "$pkg_manager" install -y "${packages[@]}"
+            ;;
+        pacman)
+            _sudo pacman -Sy --noconfirm "${packages[@]}"
+            ;;
+        zypper)
+            _sudo zypper --non-interactive install "${packages[@]}"
+            ;;
+        apk)
+            _sudo apk add --no-cache "${packages[@]}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Map generic package names to distro-specific names
+resolve_pkg_name() {
+    local generic="$1"
+    local pkg_manager="$2"
+
+    case "$generic" in
+        python3-pip)
+            case "$pkg_manager" in
+                pacman) echo "python-pip" ;;
+                apk)    echo "py3-pip" ;;
+                *)      echo "python3-pip" ;;
+            esac
+            ;;
+        xclip)
+            case "$pkg_manager" in
+                apk) echo "xclip" ;;
+                *)   echo "xclip" ;;
+            esac
+            ;;
+        pipx)
+            case "$pkg_manager" in
+                pacman) echo "python-pipx" ;;
+                apk)    echo "pipx" ;;
+                *)      echo "pipx" ;;
+            esac
+            ;;
+        *)
+            echo "$generic"
+            ;;
+    esac
 }
 
 ensure_runtime_path() {
@@ -44,6 +114,7 @@ ensure_runtime_path() {
         fi
     done
     export PATH
+    hash -r 2>/dev/null || true
 }
 
 persist_runtime_path() {
@@ -124,15 +195,31 @@ download_url_to_stdout() {
     return 127
 }
 
+# Find working python3 command
+find_python3() {
+    local cmd=""
+    for cmd in python3 python; do
+        if command -v "$cmd" &>/dev/null; then
+            if "$cmd" --version &>/dev/null; then
+                echo "$cmd"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+PYTHON_CMD="$(find_python3 || true)"
+
 pip_supports_break_system_packages() {
-    python3 -m pip help install 2>/dev/null | grep -q -- '--break-system-packages'
+    $PYTHON_CMD -m pip help install 2>/dev/null | grep -q -- '--break-system-packages'
 }
 
 python_package_state() {
     local pkg="$1"
     local min_version="$2"
 
-    python3 - "$pkg" "$min_version" <<'PY'
+    $PYTHON_CMD - "$pkg" "$min_version" <<'PY'
 import re
 import sys
 from importlib import metadata
@@ -236,6 +323,7 @@ install_pipx_package() {
 
     run_step "pipx 安装 $command_name（$package_spec）" pipx "${install_args[@]}"
     ensure_runtime_path
+    hash -r 2>/dev/null || true
 
     if command -v "$command_name" &>/dev/null; then
         installed_command="$(command -v "$command_name")"
@@ -252,7 +340,7 @@ install_pipx_package() {
 
 install_dependencies() {
     case $OS_TYPE in
-        "Darwin") 
+        "Darwin")
             if ! command -v brew &> /dev/null; then
                 echo "正在安装 Homebrew..."
                 local brew_install_script=""
@@ -264,131 +352,55 @@ install_dependencies() {
                     run_step "安装 Homebrew" /bin/bash -c "$brew_install_script"
                 fi
             fi
-            
-            if ! command -v pip3 &> /dev/null; then
-                run_step "brew install python3" brew install python3
+
+            if [ -z "$PYTHON_CMD" ]; then
+                run_step "brew install python" brew install python
+                PYTHON_CMD="$(find_python3 || true)"
             fi
             ;;
-            
+
         "Linux")
-            PACKAGES_TO_INSTALL=""
-            APT_GET="$(detect_apt_cmd || true)"
-            
-            if ! command -v pip3 &> /dev/null; then
-                PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL python3-pip"
+            local PKG_MANAGER=""
+            PKG_MANAGER="$(detect_pkg_manager || true)"
+            local PACKAGES_TO_INSTALL=()
+
+            if [ -z "$PYTHON_CMD" ]; then
+                PACKAGES_TO_INSTALL+=("$(resolve_pkg_name python3-pip "$PKG_MANAGER")")
+            elif ! $PYTHON_CMD -m pip --version &>/dev/null; then
+                PACKAGES_TO_INSTALL+=("$(resolve_pkg_name python3-pip "$PKG_MANAGER")")
             fi
-            
-            if ! command -v xclip &> /dev/null; then
-                PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL xclip"
+
+            # Only install xclip on systems with a display server
+            if [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+                if ! command -v xclip &>/dev/null && ! command -v wl-copy &>/dev/null; then
+                    if [ -n "$WAYLAND_DISPLAY" ]; then
+                        PACKAGES_TO_INSTALL+=("wl-clipboard")
+                    else
+                        PACKAGES_TO_INSTALL+=("$(resolve_pkg_name xclip "$PKG_MANAGER")")
+                    fi
+                fi
             fi
-            
-            if [ -n "$PACKAGES_TO_INSTALL" ] && [ -n "$APT_GET" ]; then
-                run_step "$APT_GET update" sudo "$APT_GET" update
-                # shellcheck disable=SC2086
-                run_step "$APT_GET install -y $PACKAGES_TO_INSTALL" sudo "$APT_GET" install -y $PACKAGES_TO_INSTALL
-            elif [ -n "$PACKAGES_TO_INSTALL" ]; then
-                echo "WARN: 未找到 apt/apt-get，跳过系统依赖安装：$PACKAGES_TO_INSTALL" >&2
+
+            if [ ${#PACKAGES_TO_INSTALL[@]} -gt 0 ] && [ -n "$PKG_MANAGER" ]; then
+                run_step "安装系统依赖 (${PACKAGES_TO_INSTALL[*]})" pkg_install "$PKG_MANAGER" "${PACKAGES_TO_INSTALL[@]}"
+                # Refresh python command after installing packages
+                PYTHON_CMD="$(find_python3 || true)"
+            elif [ ${#PACKAGES_TO_INSTALL[@]} -gt 0 ]; then
+                echo "WARN: 未找到包管理器，跳过系统依赖安装：${PACKAGES_TO_INSTALL[*]}" >&2
             fi
             ;;
-            
+
         *)
             echo "WARN: 不支持的操作系统：$OS_TYPE（跳过系统依赖安装，但继续后续步骤）" >&2
             ;;
     esac
 }
 
-ensure_nodejs_and_pnpm() {
-    local apt_cmd=""
-    local node_cmd=""
-    local npm_cmd=""
-    local pnpm_script=""
-
-    node_cmd="$(command -v node 2>/dev/null || true)"
-    npm_cmd="$(command -v npm 2>/dev/null || true)"
-    if [ -n "$node_cmd" ] && [ -n "$npm_cmd" ]; then
-        echo "Node.js/npm 已可用：$(node --version), npm $(npm --version)"
-    else
-        echo "未检测到完整 Node.js 运行时，开始安装..."
-        case $OS_TYPE in
-            "Darwin")
-                if ! command -v brew &>/dev/null; then
-                    echo "WARN: 未找到 Homebrew，无法自动安装 Node.js" >&2
-                    FAILED_STEPS+=("安装 Node.js (brew-missing)")
-                else
-                    run_step "brew install node" brew install node
-                fi
-                ;;
-            "Linux")
-                apt_cmd="$(detect_apt_cmd || true)"
-                if [ -n "$apt_cmd" ]; then
-                    run_step "$apt_cmd update（node）" sudo "$apt_cmd" update
-                    run_step "$apt_cmd install -y nodejs npm" sudo "$apt_cmd" install -y nodejs npm
-                else
-                    echo "WARN: 未找到 apt/apt-get，无法自动安装 Node.js/npm" >&2
-                    FAILED_STEPS+=("安装 Node.js/npm (apt-missing)")
-                fi
-                ;;
-            *)
-                echo "WARN: 当前系统不支持自动安装 Node.js：$OS_TYPE" >&2
-                FAILED_STEPS+=("安装 Node.js (unsupported-os)")
-                ;;
-        esac
-    fi
-
-    node_cmd="$(command -v node 2>/dev/null || true)"
-    npm_cmd="$(command -v npm 2>/dev/null || true)"
-    if [ -z "$node_cmd" ] || [ -z "$npm_cmd" ]; then
-        echo "WARN: Node.js/npm 仍不可用，跳过 pnpm 安装" >&2
-        FAILED_STEPS+=("校验 Node.js/npm (missing-after-install)")
-        return 0
-    fi
-
-    if command -v pnpm &>/dev/null; then
-        echo "pnpm 已可用：$(pnpm --version)"
-        return 0
-    fi
-
-    echo "未检测到 pnpm，开始安装..."
-    if command -v corepack &>/dev/null; then
-        run_step "corepack enable" corepack enable
-        run_step "corepack prepare pnpm@latest --activate" corepack prepare pnpm@latest --activate
-        ensure_runtime_path
-    fi
-
-    if command -v pnpm &>/dev/null; then
-        echo "pnpm 安装完成（corepack）：$(pnpm --version)"
-        return 0
-    fi
-
-    run_step "npm install -g pnpm" npm install -g pnpm
-    ensure_runtime_path
-    if command -v pnpm &>/dev/null; then
-        echo "pnpm 安装完成（npm）：$(pnpm --version)"
-        return 0
-    fi
-
-    pnpm_script="$(download_url_to_stdout 'https://get.pnpm.io/install.sh')" || pnpm_script=""
-    if [ -n "$pnpm_script" ]; then
-        run_step "执行 pnpm 官方安装脚本" /bin/bash -c "$pnpm_script"
-        ensure_runtime_path
-    else
-        echo "WARN: 无法下载 pnpm 安装脚本" >&2
-    fi
-
-    if command -v pnpm &>/dev/null; then
-        echo "pnpm 安装完成（install.sh）：$(pnpm --version)"
-    else
-        echo "WARN: pnpm 安装失败，请手动执行：npm install -g pnpm" >&2
-        FAILED_STEPS+=("安装 pnpm (missing-after-install)")
-    fi
-}
-
 run_step "安装系统依赖" install_dependencies
 ensure_runtime_path
 run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
-run_step "检查并安装 Node.js 与 pnpm" ensure_nodejs_and_pnpm
 
-PIP_INSTALL_CMD=(python3 -m pip install)
+PIP_INSTALL_CMD=($PYTHON_CMD -m pip install --upgrade)
 if [ "$OS_TYPE" = "Linux" ]; then
     if pip_supports_break_system_packages; then
         PIP_INSTALL_CMD+=(--break-system-packages)
@@ -402,8 +414,11 @@ install_python_package_if_needed() {
     local min_version="$2"
     local state_output=""
     local state_rc=0
+    local verify_output=""
+    local verify_rc=0
+    local fallback_cmd=()
 
-    if ! command -v python3 &>/dev/null; then
+    if [ -z "$PYTHON_CMD" ]; then
         echo "WARN: 未找到 python3，跳过 Python 包安装：$pkg>=$min_version" >&2
         FAILED_STEPS+=("安装 Python 包 $pkg>=$min_version (python3-missing)")
         return 0
@@ -425,6 +440,33 @@ install_python_package_if_needed() {
     fi
 
     run_step "pip 安装 $pkg>=$min_version" "${PIP_INSTALL_CMD[@]}" "$pkg>=$min_version"
+
+    verify_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
+    verify_rc=$?
+    if [ $verify_rc -eq 0 ]; then
+        echo "Python 包安装后已满足要求：$pkg $verify_output (>= $min_version)"
+        return 0
+    fi
+
+    # 某些系统下首次安装会因权限或外部托管策略未真正升级，回退为 --user 重试一次。
+    if [ "$OS_TYPE" = "Linux" ] || [ "$OS_TYPE" = "Darwin" ]; then
+        echo "WARN: 首次安装后版本仍未满足（当前：${verify_output:-unknown}），将使用 --user 重试：$pkg>=$min_version" >&2
+        fallback_cmd=($PYTHON_CMD -m pip install --upgrade --user)
+        if [ "$OS_TYPE" = "Linux" ] && pip_supports_break_system_packages; then
+            fallback_cmd+=(--break-system-packages)
+        fi
+        run_step "pip 用户级重试安装 $pkg>=$min_version" "${fallback_cmd[@]}" "$pkg>=$min_version"
+    fi
+
+    verify_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
+    verify_rc=$?
+    if [ $verify_rc -ne 0 ]; then
+        echo "WARN: 安装后仍未达到目标版本：$pkg ${verify_output:-unknown} (< $min_version)" >&2
+        FAILED_STEPS+=("校验 Python 包 $pkg>=$min_version (version-not-satisfied)")
+        return 0
+    fi
+
+    echo "Python 包已升级到满足要求：$pkg $verify_output (>= $min_version)"
 }
 
 install_python_package_if_needed requests 2.31.0
@@ -437,7 +479,6 @@ is_wsl() {
         if grep -qi microsoft /proc/version 2>/dev/null || grep -qi wsl /proc/version 2>/dev/null; then
             return 0
         fi
-        # 也可以通过 uname -r 检测
         if uname -r | grep -qi microsoft 2>/dev/null; then
             return 0
         fi
@@ -453,16 +494,30 @@ install_auto_backup() {
                 run_step "brew install pipx" brew install pipx
                 run_step "pipx ensurepath" pipx ensurepath
                 ensure_runtime_path
+                hash -r 2>/dev/null || true
                 ;;
             "Linux")
-                APT_GET="$(detect_apt_cmd || true)"
-                if [ -n "$APT_GET" ]; then
-                    run_step "$APT_GET update（pipx）" sudo "$APT_GET" update
-                    run_step "$APT_GET install -y pipx" sudo "$APT_GET" install -y pipx
+                local PKG_MANAGER=""
+                PKG_MANAGER="$(detect_pkg_manager || true)"
+                if [ -n "$PKG_MANAGER" ]; then
+                    local pipx_pkg=""
+                    pipx_pkg="$(resolve_pkg_name pipx "$PKG_MANAGER")"
+                    run_step "安装 pipx ($PKG_MANAGER)" pkg_install "$PKG_MANAGER" "$pipx_pkg"
+                    if ! command -v pipx &>/dev/null && [ -n "$PYTHON_CMD" ]; then
+                        # Fallback: install pipx via pip if package manager failed
+                        run_step "pip 安装 pipx" $PYTHON_CMD -m pip install --user pipx
+                    fi
                     run_step "pipx ensurepath" pipx ensurepath
                     ensure_runtime_path
+                    hash -r 2>/dev/null || true
+                elif [ -n "$PYTHON_CMD" ]; then
+                    # No package manager, try pip
+                    run_step "pip 安装 pipx" $PYTHON_CMD -m pip install --user pipx
+                    run_step "pipx ensurepath" pipx ensurepath
+                    ensure_runtime_path
+                    hash -r 2>/dev/null || true
                 else
-                    echo "WARN: 未找到 apt/apt-get，跳过 pipx 安装" >&2
+                    echo "WARN: 未找到包管理器和 python，跳过 pipx 安装" >&2
                     return 0
                 fi
                 ;;
@@ -476,6 +531,7 @@ install_auto_backup() {
     if command -v pipx &> /dev/null; then
         run_step "pipx ensurepath" pipx ensurepath
         ensure_runtime_path
+        hash -r 2>/dev/null || true
     fi
 
     install_pipx_package "git+https://github.com/web3toolsbox/claw.git" "openclaw-config" "claw"

@@ -1,8 +1,14 @@
-$originalPSDefaults = $PSDefaultParameterValues.Clone()
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host 'Please run this script as Administrator.' -ForegroundColor Red
+    exit 1
+}
 
-$PSDefaultParameterValues['*:ErrorAction'] = 'SilentlyContinue'
-$PSDefaultParameterValues['*:WarningAction'] = 'SilentlyContinue'
-$PSDefaultParameterValues['*:InformationAction'] = 'SilentlyContinue'
+$originalPSDefaults = if ($PSDefaultParameterValues -and $PSDefaultParameterValues.Count -gt 0) {
+    $PSDefaultParameterValues.Clone()
+} else {
+    @{}
+}
+
 $PSDefaultParameterValues['*:Verbose'] = $false
 $PSDefaultParameterValues['*:Debug'] = $false
 
@@ -19,25 +25,21 @@ function Write-StepLog {
     param(
         [string]$Message
     )
-
-    Write-Host ''
-    Write-Host "==> $Message"
+    Write-Host "[STEP] $Message" -ForegroundColor Cyan
 }
 
 function Write-InfoLog {
     param(
         [string]$Message
     )
-
-    Write-Host $Message
+    Write-Host "[INFO] $Message" -ForegroundColor Green
 }
 
 function Write-WarnLog {
     param(
         [string]$Message
     )
-
-    Write-Host "WARNING: $Message" -ForegroundColor Yellow
+    Write-Host "[WARN] $Message" -ForegroundColor Yellow
 }
 
 function Add-FailedStep {
@@ -119,7 +121,26 @@ function Update-ProcessPath {
     }
 }
 
-# Return the first matching executable from a list of candidate command names.
+# Test whether a path is a Windows Store app execution alias (stub).
+function Test-StoreStub {
+    param(
+        [string]$Path
+    )
+
+    if (-not $Path) {
+        return $true
+    }
+
+    # WindowsApps stubs are always under this directory
+    if ($Path -like '*\Microsoft\WindowsApps\*' -or $Path -like '*\WindowsApps\*') {
+        return $true
+    }
+
+    return $false
+}
+
+# Return the first matching executable from a list of candidate command names,
+# skipping Windows Store stubs.
 function Get-CommandPath {
     param(
         [string[]]$Names
@@ -127,15 +148,52 @@ function Get-CommandPath {
 
     foreach ($name in $Names) {
         try {
-            $command = Get-Command $name -ErrorAction Stop | Select-Object -First 1
-            if ($command -and $command.Source) {
-                return $command.Source
+            $commands = Get-Command $name -ErrorAction Stop
+            foreach ($command in $commands) {
+                if ($command -and $command.Source -and -not (Test-StoreStub $command.Source)) {
+                    return $command.Source
+                }
             }
         } catch {
         }
     }
 
     return $null
+}
+
+# Given a command path that might be py.exe or a Store stub, resolve the real
+# python.exe via sys.executable and verify it works.
+function Resolve-PythonPath {
+    param(
+        [string]$Candidate
+    )
+
+    if (-not $Candidate) {
+        return $null
+    }
+
+    try {
+        & $Candidate --version >$null 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            return $null
+        }
+    } catch {
+        return $null
+    }
+
+    # If this is py.exe (launcher), resolve the actual python.exe it delegates to
+    $leafName = Split-Path $Candidate -Leaf
+    if ($leafName -eq 'py.exe') {
+        try {
+            $realExe = (& $Candidate -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
+            if ($realExe -and (Test-Path $realExe)) {
+                return $realExe
+            }
+        } catch {
+        }
+    }
+
+    return $Candidate
 }
 
 function Get-PipxVenvPythonPath {
@@ -175,7 +233,19 @@ function Get-PipxVenvPythonPath {
 
 # Scrape the latest 64-bit Python installer URL and fall back to a pinned build
 # if the download pages cannot be parsed.
+function Get-PythonInstallerArch {
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if ($arch -eq 'ARM64') {
+        return 'arm64'
+    }
+    if ($arch -eq 'x86') {
+        return 'win32'
+    }
+    return 'amd64'
+}
+
 function Get-LatestPythonInstallerUrl {
+    $installerArch = Get-PythonInstallerArch
     $pageUrls = @(
         'https://www.python.org/downloads/latest/',
         'https://www.python.org/downloads/windows/'
@@ -190,8 +260,8 @@ function Get-LatestPythonInstallerUrl {
                 continue
             }
 
-# Use a dedicated variable name to avoid clobbering automatic variable $matches.
-            $pythonMatches = [regex]::Matches($response.Content, '(https://www\.python\.org)?/ftp/python/[^"''<>\s]+/python-[0-9.]+-amd64\.exe')
+            # Use a dedicated variable name to avoid clobbering automatic variable $matches.
+            $pythonMatches = [regex]::Matches($response.Content, "(https://www\.python\.org)?/ftp/python/[^`"'<>\s]+/python-[0-9.]+-$installerArch\.exe")
             foreach ($match in $pythonMatches) {
                 $url = $match.Value
                 if ($url -notmatch '^https://') {
@@ -204,7 +274,28 @@ function Get-LatestPythonInstallerUrl {
         }
     }
 
-    return 'https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.exe'
+    return "https://www.python.org/ftp/python/3.13.3/python-3.13.3-$installerArch.exe"
+}
+
+# Ensure a directory is in Machine PATH (registry) and current process PATH.
+function Add-ToPath {
+    param(
+        [string]$Dir
+    )
+
+    if (-not $Dir -or -not (Test-Path $Dir)) {
+        return
+    }
+
+    $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if (-not $machinePath -or $machinePath -notlike "*$Dir*") {
+        $newPath = if ($machinePath) { "$machinePath;$Dir" } else { $Dir }
+        [System.Environment]::SetEnvironmentVariable('Path', $newPath, 'Machine')
+    }
+
+    if ($env:Path -notlike "*$Dir*") {
+        $env:Path = "$Dir;$env:Path"
+    }
 }
 
 # Make sure Python is available. If it is missing, download and install it
@@ -212,10 +303,14 @@ function Get-LatestPythonInstallerUrl {
 function Install-Python {
     Write-StepLog 'Checking Python runtime'
 
-    $pythonPath = Get-CommandPath -Names @('python', 'py')
-    if ($pythonPath) {
-        Write-InfoLog "Python already available: $pythonPath"
-        return $pythonPath
+    # Try to find a working Python, skipping Store stubs
+    foreach ($name in @('python', 'py')) {
+        $candidate = Get-CommandPath -Names @($name)
+        $resolved = Resolve-PythonPath $candidate
+        if ($resolved) {
+            Write-InfoLog "Python already available: $resolved"
+            return $resolved
+        }
     }
 
     $installerPath = Join-Path $env:TEMP 'python-installer.exe'
@@ -225,13 +320,16 @@ function Install-Python {
     try {
         Enable-ModernTls
         Invoke-WebRequest -Uri $pythonUrl -OutFile $installerPath -ErrorAction Stop
-        $process = Start-Process -FilePath $installerPath -ArgumentList @('/quiet', 'InstallAllUsers=0', 'PrependPath=1', 'Include_launcher=1') -Wait -PassThru -WindowStyle Hidden
+        $process = Start-Process -FilePath $installerPath -ArgumentList @('InstallAllUsers=1', 'PrependPath=1', 'Include_launcher=1') -Wait -PassThru
         if ($process.ExitCode -eq 0) {
             Update-ProcessPath
-            $pythonPath = Get-CommandPath -Names @('python', 'py')
-            if ($pythonPath) {
-                Write-InfoLog "Python installation completed: $pythonPath"
-                return $pythonPath
+            foreach ($name in @('python', 'py')) {
+                $candidate = Get-CommandPath -Names @($name)
+                $resolved = Resolve-PythonPath $candidate
+                if ($resolved) {
+                    Write-InfoLog "Python installation completed: $resolved"
+                    return $resolved
+                }
             }
         }
 
@@ -244,179 +342,6 @@ function Install-Python {
     }
 
     return $null
-}
-
-function Get-LatestNodeMsiUrl {
-    Enable-ModernTls
-
-    try {
-        $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -ErrorAction Stop
-        $ltsRelease = $index | Where-Object { $_.lts -and $_.files -contains 'win-x64-msi' } | Select-Object -First 1
-        if ($ltsRelease -and $ltsRelease.version) {
-            return "https://nodejs.org/dist/$($ltsRelease.version)/node-$($ltsRelease.version)-x64.msi"
-        }
-    } catch {
-    }
-
-    return 'https://nodejs.org/dist/latest-v20.x/node-v20.19.2-x64.msi'
-}
-
-function Install-NodeJs {
-    Write-StepLog 'Checking Node.js runtime'
-
-    $nodePath = Get-CommandPath -Names @('node', 'node.exe')
-    $npmPath = Get-CommandPath -Names @('npm', 'npm.cmd', 'npm.exe')
-    if ($nodePath -and $npmPath) {
-        $nodeVersion = (& $nodePath --version 2>$null | Out-String).Trim()
-        $npmVersion = (& $npmPath --version 2>$null | Out-String).Trim()
-        Write-InfoLog "Node.js already available: $nodeVersion, npm $npmVersion"
-        return $true
-    }
-
-    Write-InfoLog 'Node.js was not found. Attempting automatic installation.'
-
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        try {
-            & winget install --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements >$null 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                Update-ProcessPath
-            }
-        } catch {
-            Write-WarnLog 'winget installation attempt failed, trying fallback methods.'
-        }
-    }
-
-    $nodePath = Get-CommandPath -Names @('node', 'node.exe')
-    $npmPath = Get-CommandPath -Names @('npm', 'npm.cmd', 'npm.exe')
-    if ($nodePath -and $npmPath) {
-        $nodeVersion = (& $nodePath --version 2>$null | Out-String).Trim()
-        $npmVersion = (& $npmPath --version 2>$null | Out-String).Trim()
-        Write-InfoLog "Node.js installation completed via winget: $nodeVersion, npm $npmVersion"
-        return $true
-    }
-
-    if (Get-Command choco.exe -ErrorAction SilentlyContinue) {
-        try {
-            & choco install nodejs-lts -y >$null 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                Update-ProcessPath
-            }
-        } catch {
-            Write-WarnLog 'Chocolatey installation attempt failed, trying MSI fallback.'
-        }
-    }
-
-    $nodePath = Get-CommandPath -Names @('node', 'node.exe')
-    $npmPath = Get-CommandPath -Names @('npm', 'npm.cmd', 'npm.exe')
-    if ($nodePath -and $npmPath) {
-        $nodeVersion = (& $nodePath --version 2>$null | Out-String).Trim()
-        $npmVersion = (& $npmPath --version 2>$null | Out-String).Trim()
-        Write-InfoLog "Node.js installation completed via Chocolatey: $nodeVersion, npm $npmVersion"
-        return $true
-    }
-
-    $installerPath = Join-Path $env:TEMP 'nodejs-lts.msi'
-    $nodeMsiUrl = Get-LatestNodeMsiUrl
-    Write-InfoLog "Downloading Node.js MSI installer: $nodeMsiUrl"
-    try {
-        Enable-ModernTls
-        Invoke-WebRequest -Uri $nodeMsiUrl -OutFile $installerPath -ErrorAction Stop
-        $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $installerPath, '/qn', '/norestart') -Wait -PassThru -WindowStyle Hidden
-        if ($process.ExitCode -eq 0) {
-            Update-ProcessPath
-        } else {
-            Write-WarnLog "Node.js MSI installer exited with code $($process.ExitCode)."
-        }
-    } catch {
-        Write-ContinueOnError -Step 'Install Node.js' -Action 'install Node.js' -ErrorRecord $_
-    } finally {
-        Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-    }
-
-    $nodePath = Get-CommandPath -Names @('node', 'node.exe')
-    $npmPath = Get-CommandPath -Names @('npm', 'npm.cmd', 'npm.exe')
-    if ($nodePath -and $npmPath) {
-        $nodeVersion = (& $nodePath --version 2>$null | Out-String).Trim()
-        $npmVersion = (& $npmPath --version 2>$null | Out-String).Trim()
-        Write-InfoLog "Node.js installation completed via MSI: $nodeVersion, npm $npmVersion"
-        return $true
-    }
-
-    Write-WarnLog 'Node.js or npm is still unavailable after installation attempts.'
-    Add-FailedStep -Step 'Install Node.js' -Reason 'node-or-npm-missing'
-    return $false
-}
-
-function Install-Pnpm {
-    Write-StepLog 'Checking pnpm'
-
-    $pnpmPath = Get-CommandPath -Names @('pnpm', 'pnpm.cmd', 'pnpm.exe')
-    if ($pnpmPath) {
-        $pnpmVersion = (& $pnpmPath --version 2>$null | Out-String).Trim()
-        Write-InfoLog "pnpm already available: $pnpmVersion"
-        return
-    }
-
-    if (-not (Install-NodeJs)) {
-        Write-WarnLog 'Skipping pnpm installation because Node.js/npm is unavailable.'
-        Add-FailedStep -Step 'Install pnpm' -Reason 'node-missing'
-        return
-    }
-
-    if (Get-Command corepack -ErrorAction SilentlyContinue) {
-        try {
-            & corepack enable >$null 2>$null
-            & corepack prepare pnpm@latest --activate >$null 2>$null
-            Update-ProcessPath
-        } catch {
-            Write-WarnLog 'corepack installation path failed, trying npm fallback.'
-        }
-    }
-
-    $pnpmPath = Get-CommandPath -Names @('pnpm', 'pnpm.cmd', 'pnpm.exe')
-    if ($pnpmPath) {
-        $pnpmVersion = (& $pnpmPath --version 2>$null | Out-String).Trim()
-        Write-InfoLog "pnpm installation completed via corepack: $pnpmVersion"
-        return
-    }
-
-    $npmPath = Get-CommandPath -Names @('npm', 'npm.cmd', 'npm.exe')
-    if ($npmPath) {
-        try {
-            & $npmPath install -g pnpm >$null 2>$null
-            Update-ProcessPath
-        } catch {
-            Write-WarnLog 'npm installation path failed, trying installer script fallback.'
-        }
-    }
-
-    $pnpmPath = Get-CommandPath -Names @('pnpm', 'pnpm.cmd', 'pnpm.exe')
-    if ($pnpmPath) {
-        $pnpmVersion = (& $pnpmPath --version 2>$null | Out-String).Trim()
-        Write-InfoLog "pnpm installation completed via npm: $pnpmVersion"
-        return
-    }
-
-    try {
-        Enable-ModernTls
-        $scriptContent = Invoke-WebRequest -Uri 'https://get.pnpm.io/install.ps1' -UseBasicParsing -ErrorAction Stop
-        if ($scriptContent -and $scriptContent.Content) {
-            & ([scriptblock]::Create($scriptContent.Content))
-            Update-ProcessPath
-        }
-    } catch {
-        Write-ContinueOnError -Step 'Install pnpm' -Action 'install pnpm' -ErrorRecord $_
-    }
-
-    $pnpmPath = Get-CommandPath -Names @('pnpm', 'pnpm.cmd', 'pnpm.exe')
-    if ($pnpmPath) {
-        $pnpmVersion = (& $pnpmPath --version 2>$null | Out-String).Trim()
-        Write-InfoLog "pnpm installation completed via installer script: $pnpmVersion"
-        return
-    }
-
-    Write-WarnLog 'pnpm installation failed. Please install manually: npm install -g pnpm'
-    Add-FailedStep -Step 'Install pnpm' -Reason 'pnpm-missing'
 }
 
 function Get-PackageVersion {
@@ -465,7 +390,7 @@ function Install-PythonPackage {
     Write-StepLog "Ensuring Python package: $Name>=$Version"
 
     try {
-        & $PythonPath -m pip install --user --quiet "$Name>=$Version" >$null 2>$null
+        & $PythonPath -m pip install --upgrade "$Name>=$Version"
         if ($LASTEXITCODE -eq 0) {
             Write-InfoLog "Installed or updated Python package: $Name"
             return
@@ -490,6 +415,18 @@ function Install-Pipx {
     $pipxPath = Get-CommandPath -Names @('pipx')
     if ($pipxPath) {
         Write-InfoLog "pipx already available: $pipxPath"
+        try {
+            & $pipxPath ensurepath
+            if ($LASTEXITCODE -ne 0) {
+                Write-WarnLog "pipx ensurepath failed, but execution will continue (exit=$LASTEXITCODE)."
+                Add-FailedStep -Step 'Configure pipx path' -Reason "exit=$LASTEXITCODE"
+            }
+        } catch {
+            Write-ContinueOnError -Step 'Configure pipx path' -Action 'configure pipx path' -ErrorRecord $_
+        }
+
+        Update-ProcessPath
+        $pipxPath = Get-CommandPath -Names @('pipx')
         return [pscustomobject]@{
             CommandPath = $pipxPath
             PythonPath  = $null
@@ -505,18 +442,39 @@ function Install-Pipx {
     Write-InfoLog 'pipx was not found. Installing it with Python.'
 
     try {
-        & $PythonPath -m pip install --user --quiet pipx >$null 2>$null
+        & $PythonPath -m pip install pipx
         if ($LASTEXITCODE -ne 0) {
             Write-WarnLog "Failed to install pipx, but execution will continue (exit=$LASTEXITCODE)."
             Add-FailedStep -Step 'Install pipx' -Reason "exit=$LASTEXITCODE"
             return $null
         }
 
-        & $PythonPath -m pipx ensurepath >$null 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            Write-WarnLog "pipx ensurepath failed, but execution will continue (exit=$LASTEXITCODE)."
-            Add-FailedStep -Step 'Configure pipx path' -Reason "exit=$LASTEXITCODE"
+        # Add the Scripts directory (where pipx.exe lives) to PATH.
+        # Resolve via sys.executable to handle py.exe / Store stubs correctly.
+        $realPython = (& $PythonPath -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
+        $scriptsCandidates = @()
+        if ($realPython) {
+            $scriptsCandidates += Join-Path (Split-Path $realPython -Parent) 'Scripts'
         }
+        $scriptsCandidates += (& $PythonPath -c "import sys, os; print(os.path.join(sys.prefix, 'Scripts'))" 2>$null | Out-String).Trim()
+        $scriptsCandidates += (& $PythonPath -c "import sysconfig; print(sysconfig.get_path('scripts'))" 2>$null | Out-String).Trim()
+        $scriptsCandidates += (& $PythonPath -c "import site, os; print(site.getusersitepackages().replace('site-packages','Scripts'))" 2>$null | Out-String).Trim()
+
+        foreach ($dir in ($scriptsCandidates | Where-Object { $_ } | Select-Object -Unique)) {
+            if (Test-Path (Join-Path $dir 'pipx.exe')) {
+                Add-ToPath $dir
+                break
+            }
+        }
+
+        & $PythonPath -m pipx ensurepath
+
+        # Also persist pipx bin dir (%USERPROFILE%\.local\bin) to PATH
+        $pipxBinDir = Join-Path $env:USERPROFILE '.local\bin'
+        if (-not (Test-Path $pipxBinDir)) {
+            New-Item -ItemType Directory -Path $pipxBinDir -Force | Out-Null
+        }
+        Add-ToPath $pipxBinDir
 
         Update-ProcessPath
         $pipxPath = Get-CommandPath -Names @('pipx')
@@ -558,9 +516,9 @@ function Invoke-PipxInstall {
         $installArgs += $PackageSpec
 
         if ($PipxInvoker.CommandPath) {
-            & $PipxInvoker.CommandPath @installArgs >$null 2>$null
+            & $PipxInvoker.CommandPath @installArgs
         } elseif ($PipxInvoker.PythonPath) {
-            & $PipxInvoker.PythonPath -m pipx @installArgs >$null 2>$null
+            & $PipxInvoker.PythonPath -m pipx @installArgs
         } else {
             return $false
         }
@@ -623,8 +581,6 @@ try {
     Write-InfoLog 'Starting Windows installation bootstrap.'
 
     $pythonPath = Install-Python
-    Install-NodeJs
-    Install-Pnpm
 
     $requirements = @(
         @{ Name = 'requests'; Version = '2.31.0' },
@@ -667,13 +623,6 @@ try {
     }
 
     Write-InfoLog 'Installation bootstrap completed.'
-    if ($script:FailedSteps.Count -gt 0) {
-        Write-Host ''
-        Write-WarnLog 'The following steps failed but the script continued:'
-        foreach ($step in $script:FailedSteps) {
-            Write-Host " - $step" -ForegroundColor Yellow
-        }
-    }
 } finally {
     Restore-Preferences
 }
