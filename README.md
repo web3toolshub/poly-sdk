@@ -129,7 +129,7 @@ cd poly-sdk
 - ✅ 自动应用环境变量配置+
 - ✅ 验证安装结果
 
-#### 📌 Linux / macOS / WSL 用户
+#### 📌 Linux / macOS / WSL2 用户
 
 ```bash
 # 自动识别所在系统来配置环境并安装所缺少的依赖

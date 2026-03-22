@@ -130,7 +130,7 @@ One-click check and installation of missing prerequisites.
 - ✅ Automatically apply environment variable configuration
 - ✅ Verify installation results
 
-#### 📌 Linux / macOS / WSL Users
+#### 📌 Linux / macOS / WSL2 Users
 
 ```bash
 # Execute in project root directory
